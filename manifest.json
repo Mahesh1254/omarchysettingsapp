@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.mahesh1254.settings",
+  "name": "Settings",
+  "version": "1.0.0",
+  "author": "Mahesh1254",
+  "description": "Windows-style system settings app for Omarchy (sound, display, power, input, gestures, network, personalization, updates, apps, recovery).",
+  "kinds": [
+    "overlay"
+  ],
+  "entryPoints": {
+    "overlay": "SettingsOverlay.qml"
+  }
+}
