@@ -1,6 +1,13 @@
-"""Input devices page: touchpad, natural scroll, CapsLock behavior."""
+"""Input devices page: touchpad, natural scroll, CapsLock behavior.
+
+Every write to ~/.config/hypr/input.lua is backed up to
+input.lua.bak.settings-app and validated with `hyprctl reload` +
+`hyprctl configerrors`; the backup is restored if Hyprland reports an
+error.
+"""
 
 import re
+import shutil
 from pathlib import Path
 
 from gi.repository import Adw, Gtk
@@ -8,7 +15,69 @@ from gi.repository import Adw, Gtk
 from helpers import run, run_ok, toast
 
 INPUT_LUA = Path.home() / ".config" / "hypr" / "input.lua"
+BACKUP_NAME = "input.lua.bak.settings-app"
 COMPOSE_OPTS = "compose:caps,shift:both_capslock_cancel"
+
+# XKB layout/variant tokens: letters, digits, underscore, plus, hyphen,
+# comma (for "us,de" style multi-layout). Anything else is rejected so
+# user input can never break out of the Lua string.
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_+,-]{1,32}$")
+
+
+def _lua_escape(value: str) -> str:
+    """Escape a validated token for a double-quoted Lua string."""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _check_token(name: str, value: str, allow_empty: bool = False) -> str:
+    if not value:
+        if allow_empty:
+            return ""
+        raise ValueError(f"Invalid {name}: empty")
+    if not _TOKEN_RE.match(value):
+        raise ValueError(f"Invalid {name}: {value!r} "
+                         "(use letters, digits, _ + - , only)")
+    for part in value.split(","):
+        if not part or len(part) > 16:
+            raise ValueError(f"Invalid {name}: {value!r}")
+    return _lua_escape(value)
+
+
+def _write_lines(lines: list[str]) -> None:
+    """Write input.lua with backup + hyprctl validation.
+
+    Restores the backup and raises RuntimeError if `hyprctl reload`
+    fails or `hyprctl configerrors` reports an error.
+    """
+    backup = INPUT_LUA.parent / BACKUP_NAME
+    had_backup = False
+    try:
+        if INPUT_LUA.exists():
+            shutil.copy2(INPUT_LUA, backup)
+            had_backup = True
+        INPUT_LUA.write_text("\n".join(lines) + "\n")
+    except OSError as exc:
+        raise RuntimeError(f"Cannot write input.lua: {exc}") from exc
+    try:
+        run("hyprctl", "reload")
+        errs = run("hyprctl", "configerrors")
+    except Exception as exc:  # noqa: BLE001
+        try:
+            if had_backup:
+                shutil.copy2(backup, INPUT_LUA)
+                run_ok("hyprctl", "reload")
+        except Exception:
+            pass
+        raise RuntimeError(f"hyprctl failed, restored backup: {exc}") from exc
+    if errs.strip():
+        try:
+            if had_backup:
+                shutil.copy2(backup, INPUT_LUA)
+                run_ok("hyprctl", "reload")
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Hyprland rejected change, restored backup: {errs[:200]}")
 
 
 def _active_lines() -> list[str]:
@@ -39,7 +108,11 @@ def _caps_mode() -> int:
 
 
 def _set_lua(key: str, value: str) -> bool:
-    """Rewrite key = value on its active line, else append an override."""
+    """Rewrite key = value on its active line, else append an override.
+
+    Backs up input.lua and restores it if Hyprland reports config
+    errors (see _write_lines). Raises RuntimeError on failure.
+    """
     try:
         lines = INPUT_LUA.read_text().splitlines()
     except OSError as exc:
@@ -59,8 +132,8 @@ def _set_lua(key: str, value: str) -> bool:
         lines.append(f"    {key} = {value},")
         lines.append("  },")
         lines.append("})")
-    INPUT_LUA.write_text("\n".join(lines) + "\n")
-    return run_ok("hyprctl", "reload")
+    _write_lines(lines)
+    return True
 
 
 def _touchpad_on() -> bool:
@@ -79,7 +152,11 @@ def _live(opt: str, default: str = "") -> str:
 
 
 def _set_touchpad(key: str, value: str) -> bool:
-    """Set input.touchpad.<key>, creating the block if needed."""
+    """Set input.touchpad.<key>, creating the block if needed.
+
+    Backs up input.lua and restores it if Hyprland reports config
+    errors (see _write_lines). Raises RuntimeError on failure.
+    """
     try:
         lines = INPUT_LUA.read_text().splitlines()
     except OSError as exc:
@@ -110,8 +187,8 @@ def _set_touchpad(key: str, value: str) -> bool:
         lines.append("    },")
         lines.append("  },")
         lines.append("})")
-    INPUT_LUA.write_text("\n".join(lines) + "\n")
-    return run_ok("hyprctl", "reload")
+    _write_lines(lines)
+    return True
 
 
 def _touchscreen_on() -> bool:
@@ -121,12 +198,16 @@ def _touchscreen_on() -> bool:
 
 def _apply_layout(overlay: Adw.ToastOverlay, lay_row: Adw.EntryRow,
                   var_row: Adw.EntryRow) -> None:
-    layout = lay_row.get_text().strip() or "us"
-    variant = var_row.get_text().strip()
+    raw_layout = lay_row.get_text().strip() or "us"
+    raw_variant = var_row.get_text().strip()
     try:
+        layout = _check_token("layout", raw_layout)
+        variant = _check_token("variant", raw_variant, allow_empty=True)
         _set_lua("kb_layout", f'"{layout}"')
         _set_lua("kb_variant", f'"{variant}"')
-        toast(overlay, f"Layout → {layout or variant or 'us'}")
+        toast(overlay, f"Layout → {raw_layout or raw_variant or 'us'}")
+    except (ValueError, RuntimeError) as exc:
+        toast(overlay, f"Failed: {exc}")
     except Exception as exc:  # noqa: BLE001
         toast(overlay, f"Failed: {exc}")
 
