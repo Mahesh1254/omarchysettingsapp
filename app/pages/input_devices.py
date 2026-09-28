@@ -1,20 +1,22 @@
 """Input devices page: touchpad, natural scroll, CapsLock behavior.
 
 Every write to ~/.config/hypr/input.lua is backed up to
-input.lua.bak.settings-app and written atomically (temp file + fsync +
-os.replace, so a failed write never truncates the live file), then
-validated with `hyprctl reload` + `hyprctl configerrors`; the backup
-is restored if the write or Hyprland reports an error.
+input.lua.bak.settings-app and written atomically via mkstemp (random
+name, O_EXCL) + fsync + os.replace, so a failed write never truncates
+the live file and a pre-planted symlink at a predictable tmp/backup
+path cannot redirect the write; symlinked input.lua/backup files are
+refused instead of followed. Validated with `hyprctl reload` +
+`hyprctl configerrors`; the backup is restored if the write or
+Hyprland reports an error.
 """
 
-import os
 import re
-import shutil
 from pathlib import Path
 
 from gi.repository import Adw, Gtk
 
-from helpers import run, run_ok, toast
+from helpers import (atomic_write_text, refuse_if_symlink, run, run_ok,
+                     secure_backup, secure_restore, toast)
 
 INPUT_LUA = Path.home() / ".config" / "hypr" / "input.lua"
 BACKUP_NAME = "input.lua.bak.settings-app"
@@ -46,34 +48,34 @@ def _check_token(name: str, value: str, allow_empty: bool = False) -> str:
 
 
 def _write_lines(lines: list[str]) -> None:
-    """Write input.lua atomically with backup + hyprctl validation.
+    """Write input.lua symlink-safely, atomically, with backup + validation.
 
-    The new content goes to a temp file in the same directory, is
-    fsync'd, then atomically replaces the live file via os.replace, so
-    a full disk or interrupted write can never leave a truncated
-    input.lua behind. Restores the backup and raises RuntimeError if
-    the write/replace fails, `hyprctl reload` fails, or `hyprctl
-    configerrors` reports an error.
+    Backup and live writes go through helpers.secure_backup /
+    helpers.atomic_write_text (mkstemp random tmp + fsync + os.replace),
+    so no predictable-path write_text and no shutil.copy2 that follows a
+    destination symlink. A symlinked input.lua or backup is refused
+    instead of followed/replaced. Restores the backup and raises
+    RuntimeError if the write, `hyprctl reload`, or `hyprctl
+    configerrors` fails.
     """
     backup = INPUT_LUA.parent / BACKUP_NAME
-    tmp = INPUT_LUA.parent / (INPUT_LUA.name + ".tmp.settings-app")
+    refuse_if_symlink(INPUT_LUA, "input.lua")
+    if backup.is_symlink():
+        raise RuntimeError(
+            "input.lua backup is a symlink, refusing to overwrite "
+            "(remove it manually)")
     had_backup = False
     try:
-        if INPUT_LUA.exists():
-            shutil.copy2(INPUT_LUA, backup)
-            had_backup = True
-        tmp.write_text("\n".join(lines) + "\n")
-        with open(tmp, "rb") as fh:
-            os.fsync(fh.fileno())
-        os.replace(tmp, INPUT_LUA)
-    except OSError as exc:
         try:
-            tmp.unlink(missing_ok=True)
+            mode = INPUT_LUA.stat().st_mode & 0o777
         except OSError:
-            pass
+            mode = 0o644
+        had_backup = secure_backup(INPUT_LUA, backup)
+        atomic_write_text(INPUT_LUA, "\n".join(lines) + "\n", mode=mode)
+    except (OSError, RuntimeError) as exc:
         try:
             if had_backup:
-                shutil.copy2(backup, INPUT_LUA)
+                secure_restore(backup, INPUT_LUA)
                 run_ok("hyprctl", "reload")
         except Exception:
             pass
@@ -84,7 +86,7 @@ def _write_lines(lines: list[str]) -> None:
     except Exception as exc:  # noqa: BLE001
         try:
             if had_backup:
-                shutil.copy2(backup, INPUT_LUA)
+                secure_restore(backup, INPUT_LUA)
                 run_ok("hyprctl", "reload")
         except Exception:
             pass
@@ -92,7 +94,7 @@ def _write_lines(lines: list[str]) -> None:
     if errs.strip():
         try:
             if had_backup:
-                shutil.copy2(backup, INPUT_LUA)
+                secure_restore(backup, INPUT_LUA)
                 run_ok("hyprctl", "reload")
         except Exception:
             pass

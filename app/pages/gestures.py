@@ -2,18 +2,19 @@
 
 Reads active hl.gesture blocks, lets you reassign each from a fixed
 palette, add new ones, or delete them. Every write is backed up and
-written atomically (temp file + fsync + os.replace), then validated
-with `hyprctl reload` + `hyprctl configerrors`.
+written atomically via mkstemp (random name, O_EXCL) + fsync +
+os.replace, so a pre-planted symlink cannot redirect it; symlinked
+input.lua/backup files are refused instead of followed. Validated with
+`hyprctl reload` + `hyprctl configerrors`.
 """
 
-import os
 import re
-import shutil
 from pathlib import Path
 
 from gi.repository import Adw, Gtk
 
-from helpers import run, run_ok, toast
+from helpers import (atomic_write_text, run, run_ok, secure_backup,
+                     secure_restore, toast)
 
 INPUT_LUA = Path.home() / ".config" / "hypr" / "input.lua"
 
@@ -133,23 +134,25 @@ def _drop_conflicts(lines: list[str], fingers: str,
 
 
 def _write(lines: list[str], what: str, overlay) -> bool:
-    """Backup, atomic-write, reload, validate. Restores backup on error."""
+    """Backup, symlink-safe atomic-write, reload, validate."""
     backup = INPUT_LUA.parent / "input.lua.bak.settings-app"
-    tmp = INPUT_LUA.parent / (INPUT_LUA.name + ".tmp.settings-app")
     had_backup = False
     try:
-        if INPUT_LUA.exists():
-            shutil.copy2(INPUT_LUA, backup)
-            had_backup = True
-        tmp.write_text("\n".join(lines) + "\n")
-        with open(tmp, "rb") as fh:
-            os.fsync(fh.fileno())
-        os.replace(tmp, INPUT_LUA)
+        if INPUT_LUA.is_symlink() or backup.is_symlink():
+            raise RuntimeError(
+                "input.lua or its backup is a symlink, refusing to "
+                "overwrite (edit the real file manually)")
+        try:
+            mode = INPUT_LUA.stat().st_mode & 0o777
+        except OSError:
+            mode = 0o644
+        had_backup = secure_backup(INPUT_LUA, backup)
+        atomic_write_text(INPUT_LUA, "\n".join(lines) + "\n", mode=mode)
         run("hyprctl", "reload")
         errs = run("hyprctl", "configerrors")
         if errs.strip():
             if had_backup:
-                shutil.copy2(backup, INPUT_LUA)
+                secure_restore(backup, INPUT_LUA)
                 run("hyprctl", "reload")
             toast(overlay, f"Hyprland rejected it, restored: {errs[:120]}")
             return False
@@ -157,13 +160,8 @@ def _write(lines: list[str], what: str, overlay) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001
         try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
             if had_backup:
-                # Write/replace failed mid-way: restore last good copy.
-                shutil.copy2(backup, INPUT_LUA)
+                secure_restore(backup, INPUT_LUA)
                 run_ok("hyprctl", "reload")
         except Exception:
             pass
