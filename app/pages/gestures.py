@@ -2,9 +2,11 @@
 
 Reads active hl.gesture blocks, lets you reassign each from a fixed
 palette, add new ones, or delete them. Every write is backed up and
-validated with `hyprctl reload` + `hyprctl configerrors`.
+written atomically (temp file + fsync + os.replace), then validated
+with `hyprctl reload` + `hyprctl configerrors`.
 """
 
+import os
 import re
 import shutil
 from pathlib import Path
@@ -131,21 +133,40 @@ def _drop_conflicts(lines: list[str], fingers: str,
 
 
 def _write(lines: list[str], what: str, overlay) -> bool:
-    """Backup, write, reload, validate. Restores backup on error."""
-    backup = INPUT_LUA.parent / f"input.lua.bak.settings-app"
+    """Backup, atomic-write, reload, validate. Restores backup on error."""
+    backup = INPUT_LUA.parent / "input.lua.bak.settings-app"
+    tmp = INPUT_LUA.parent / (INPUT_LUA.name + ".tmp.settings-app")
+    had_backup = False
     try:
-        shutil.copy2(INPUT_LUA, backup)
-        INPUT_LUA.write_text("\n".join(lines) + "\n")
+        if INPUT_LUA.exists():
+            shutil.copy2(INPUT_LUA, backup)
+            had_backup = True
+        tmp.write_text("\n".join(lines) + "\n")
+        with open(tmp, "rb") as fh:
+            os.fsync(fh.fileno())
+        os.replace(tmp, INPUT_LUA)
         run("hyprctl", "reload")
         errs = run("hyprctl", "configerrors")
         if errs.strip():
-            shutil.copy2(backup, INPUT_LUA)
-            run("hyprctl", "reload")
+            if had_backup:
+                shutil.copy2(backup, INPUT_LUA)
+                run("hyprctl", "reload")
             toast(overlay, f"Hyprland rejected it, restored: {errs[:120]}")
             return False
         toast(overlay, what)
         return True
     except Exception as exc:  # noqa: BLE001
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            if had_backup:
+                # Write/replace failed mid-way: restore last good copy.
+                shutil.copy2(backup, INPUT_LUA)
+                run_ok("hyprctl", "reload")
+        except Exception:
+            pass
         toast(overlay, f"Failed: {exc}")
         return False
 

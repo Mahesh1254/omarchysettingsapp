@@ -1,11 +1,13 @@
 """Input devices page: touchpad, natural scroll, CapsLock behavior.
 
 Every write to ~/.config/hypr/input.lua is backed up to
-input.lua.bak.settings-app and validated with `hyprctl reload` +
-`hyprctl configerrors`; the backup is restored if Hyprland reports an
-error.
+input.lua.bak.settings-app and written atomically (temp file + fsync +
+os.replace, so a failed write never truncates the live file), then
+validated with `hyprctl reload` + `hyprctl configerrors`; the backup
+is restored if the write or Hyprland reports an error.
 """
 
+import os
 import re
 import shutil
 from pathlib import Path
@@ -44,19 +46,37 @@ def _check_token(name: str, value: str, allow_empty: bool = False) -> str:
 
 
 def _write_lines(lines: list[str]) -> None:
-    """Write input.lua with backup + hyprctl validation.
+    """Write input.lua atomically with backup + hyprctl validation.
 
-    Restores the backup and raises RuntimeError if `hyprctl reload`
-    fails or `hyprctl configerrors` reports an error.
+    The new content goes to a temp file in the same directory, is
+    fsync'd, then atomically replaces the live file via os.replace, so
+    a full disk or interrupted write can never leave a truncated
+    input.lua behind. Restores the backup and raises RuntimeError if
+    the write/replace fails, `hyprctl reload` fails, or `hyprctl
+    configerrors` reports an error.
     """
     backup = INPUT_LUA.parent / BACKUP_NAME
+    tmp = INPUT_LUA.parent / (INPUT_LUA.name + ".tmp.settings-app")
     had_backup = False
     try:
         if INPUT_LUA.exists():
             shutil.copy2(INPUT_LUA, backup)
             had_backup = True
-        INPUT_LUA.write_text("\n".join(lines) + "\n")
+        tmp.write_text("\n".join(lines) + "\n")
+        with open(tmp, "rb") as fh:
+            os.fsync(fh.fileno())
+        os.replace(tmp, INPUT_LUA)
     except OSError as exc:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            if had_backup:
+                shutil.copy2(backup, INPUT_LUA)
+                run_ok("hyprctl", "reload")
+        except Exception:
+            pass
         raise RuntimeError(f"Cannot write input.lua: {exc}") from exc
     try:
         run("hyprctl", "reload")
